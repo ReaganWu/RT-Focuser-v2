@@ -1,6 +1,6 @@
 # RT-Focuser-V2
 
-Official implementation of **RT-Focuser-V2: Progressive All-Scale Attention for Real-Time Image Deblurring**, submitted to IEEE ICTA 2026.
+Official implementation of **RT-Focuser-V2: Progressive All-Scale Attention for Real-Time Image Deblurring**.
 
 RT-Focuser-V2 is a compact multi-exit image deblurring network built from lightweight LD blocks, an Efficient Global Attention Module (E-GAM), and progressive restoration exits. A deployment selects one of four fixed exits before inference to obtain a deterministic quality-latency operating point.
 
@@ -38,7 +38,7 @@ pip install -r requirements.txt
 
 ## Inference
 
-Place the ICTA 2026 checkpoint at `weights/rt-focuser-v2-gopro.pth`, then run:
+Place the official checkpoint at `weights/rt-focuser-v2-gopro.pth`, then run:
 
 ```bash
 python inference.py \
@@ -92,17 +92,6 @@ python rt_focuser_v2.py \
   --exit 4 \
   --out-dir exports/Y4 \
   --skip-coreml
-```
-
-## Citation
-
-```bibtex
-@inproceedings{wu2026rtfocuserv2,
-  title={RT-Focuser-V2: Progressive All-Scale Attention for Real-Time Image Deblurring},
-  author={Wu, Zhuoyu and Ou, Wenhui and Tan, Pei-Sze and Zheng, Qiawei and Wang, Quanjun and Fang, Wenqi and Wang, Zheng and Phan, Raphael C.-W.},
-  booktitle={2026 IEEE International Conference on Integrated Circuits, Technologies and Applications (ICTA)},
-  year={2026}
-}
 ```
 
 ## License
