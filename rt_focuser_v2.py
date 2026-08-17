@@ -7,7 +7,7 @@ This variant intentionally follows the clean RT-Focuser-v1 data flow:
     input -> encoder pyramid -> four cross-scale fusion maps -> U-shaped decoder
 
 The main change is the fusion block. Instead of transformer-style MHA, E-GAM
-uses convolutional projection plus MobileViTv2-style linear self-attention:
+uses convolutional projection plus Separable Linear Attention (SLA):
 Q is a one-channel spatial score map, K/V are feature maps, and global context is
 formed with element-wise multiply and reduction.  There is no QK^T attention
 matrix, no multi-head matmul, and no LayerNorm.
@@ -120,7 +120,7 @@ class Residual(nn.Module):
 class LD_Block(nn.Module):
     """RT-Focuser-v1 LD block with configurable activation.
 
-    ReLU is the default for MobileGAM because it maps to a very simple Core ML
+    ReLU is the default because it maps to a very simple Core ML
     activation and avoids GELU's extra approximation work.
     """
 
@@ -154,8 +154,8 @@ class LD_Block(nn.Module):
         return self.up(self.block(x))
 
 
-class MobileLinearAttention2d(nn.Module):
-    """MobileViTv2-style linear attention for 2D feature maps.
+class SeparableLinearAttention(nn.Module):
+    """Separable Linear Attention (SLA) for 2D feature maps.
 
     This keeps QKV as 1x1 convolutions but avoids QK^T.  Q is a single-channel
     spatial score map, K/V stay channels-first feature maps, and the global
@@ -179,10 +179,10 @@ class MobileLinearAttention2d(nn.Module):
         return self.out_proj(out)
 
 
-class MobileGAMFusion(nn.Module):
-    """V1-style multi-scale fusion plus mobile-friendly global modulation."""
+class AllScaleAttentionFusion(nn.Module):
+    """All-scale feature fusion with SLA-based global modulation."""
 
-    def __init__(self, in_channels_list: Sequence[int], out_channels: int, act: str = "relu", use_attention: bool = True):
+    def __init__(self, in_channels_list: Sequence[int], out_channels: int, act: str = "relu", use_sla: bool = True):
         super().__init__()
         self.in_channels_list = tuple(int(c) for c in in_channels_list)
         self.out_channels = int(out_channels)
@@ -209,9 +209,9 @@ class MobileGAMFusion(nn.Module):
             nn.Conv2d(hidden, self.out_channels, kernel_size=1, bias=False),
             nn.Sigmoid(),
         )
-        self.use_attention = bool(use_attention)
-        self.mobile_attention = MobileLinearAttention2d(self.out_channels, act=act) if self.use_attention else nn.Identity()
-        self.attn_scale = nn.Parameter(torch.tensor(0.10))
+        self.use_sla = bool(use_sla)
+        self.sla = SeparableLinearAttention(self.out_channels, act=act) if self.use_sla else nn.Identity()
+        self.sla_scale = nn.Parameter(torch.tensor(0.10))
 
     def forward(self, inputs: Sequence[Tensor]) -> Tensor:
         target_size = inputs[-1].shape[-2:]
@@ -222,19 +222,19 @@ class MobileGAMFusion(nn.Module):
             projected.append(branch(feat))
         fused = self.fusion_conv(torch.cat(projected, dim=1))
         fused = fused * self.channel_attention(fused)
-        if self.use_attention:
-            fused = fused + self.attn_scale * self.mobile_attention(fused)
+        if self.use_sla:
+            fused = fused + self.sla_scale * self.sla(fused)
         return fused
 
 
-class ProgressiveMobileGAMFuse(nn.Module):
-    """Fuse a lower-resolution state with the next higher-resolution skip.
+class EfficientGlobalAttentionModule(nn.Module):
+    """E-GAM fuses a coarse state with the next finer-scale feature.
 
     The output resolution follows the skip feature.  This creates a clear
     progressive path: x4+x3 -> m3, m3+x2 -> m2, and m2+x1 -> m1.
     """
 
-    def __init__(self, low_channels: int, skip_channels: int, out_channels: int, act: str = "relu", use_attention: bool = True):
+    def __init__(self, low_channels: int, skip_channels: int, out_channels: int, act: str = "relu", use_sla: bool = True):
         super().__init__()
         self.low_proj = nn.Sequential(
             nn.Conv2d(low_channels, out_channels, kernel_size=1, bias=False),
@@ -259,17 +259,17 @@ class ProgressiveMobileGAMFuse(nn.Module):
             nn.Conv2d(hidden, out_channels, kernel_size=1, bias=False),
             nn.Sigmoid(),
         )
-        self.use_attention = bool(use_attention)
-        self.mobile_attention = MobileLinearAttention2d(out_channels, act=act) if self.use_attention else nn.Identity()
-        self.attn_scale = nn.Parameter(torch.tensor(0.10))
+        self.use_sla = bool(use_sla)
+        self.sla = SeparableLinearAttention(out_channels, act=act) if self.use_sla else nn.Identity()
+        self.sla_scale = nn.Parameter(torch.tensor(0.10))
 
     def forward(self, low: Tensor, skip: Tensor) -> Tensor:
         if low.shape[-2:] != skip.shape[-2:]:
             low = F.interpolate(low, size=skip.shape[-2:], mode="nearest")
         fused = self.mix(torch.cat([self.low_proj(low), self.skip_proj(skip)], dim=1))
         fused = fused * self.channel_attention(fused)
-        if self.use_attention:
-            fused = fused + self.attn_scale * self.mobile_attention(fused)
+        if self.use_sla:
+            fused = fused + self.sla_scale * self.sla(fused)
         return fused
 
 
@@ -356,7 +356,7 @@ class XFuse_Block(nn.Module):
         return self.conv2(x)
 
 
-class RT_Focuser_MobileGAM(nn.Module):
+class RTFocuserV2(nn.Module):
     def __init__(
         self,
         input_channel: int = 3,
@@ -366,7 +366,7 @@ class RT_Focuser_MobileGAM(nn.Module):
         act: str = "relu",
         upsample_mode: str = "nearest",
         use_sharpen: bool = True,
-        use_mobile_attention: bool = True,
+        use_sla: bool = True,
         exit_level: int = 4,
         use_sppf: bool = False,
         sppf_activation: str = "silu",
@@ -400,9 +400,9 @@ class RT_Focuser_MobileGAM(nn.Module):
             nn.Conv2d(d[3], d[3], kernel_size=1, bias=True),
             nn.BatchNorm2d(d[3]),
         )
-        self.fuse3 = ProgressiveMobileGAMFuse(d[3], d[2], d[2], act=act, use_attention=use_mobile_attention)
-        self.fuse2 = ProgressiveMobileGAMFuse(d[2], d[1], d[1], act=act, use_attention=use_mobile_attention)
-        self.fuse1 = ProgressiveMobileGAMFuse(d[1], d[0], d[0], act=act, use_attention=use_mobile_attention)
+        self.fuse3 = EfficientGlobalAttentionModule(d[3], d[2], d[2], act=act, use_sla=use_sla)
+        self.fuse2 = EfficientGlobalAttentionModule(d[2], d[1], d[1], act=act, use_sla=use_sla)
+        self.fuse1 = EfficientGlobalAttentionModule(d[1], d[0], d[0], act=act, use_sla=use_sla)
 
         self.exit1_head = PyramidExitHead(d[2], act=act, residual_scale=1.0)
         self.exit2_head = PyramidExitHead(d[1], act=act, residual_scale=1.0)
@@ -495,33 +495,33 @@ class RT_Focuser_MobileGAM(nn.Module):
         return self.forward_exit(x, self.exit_level)
 
 
-def RT_Focuser_MobileGAM_Standard(
+def build_rt_focuser_v2(
     dims: Sequence[int] = (16, 32, 128, 160, 256),
     depths: Sequence[int] = (3, 4, 4, 3, 2),
     kernels: Sequence[int] = (3, 3, 7, 7, 7),
     act: str = "relu",
     upsample_mode: str = "nearest",
     use_sharpen: bool = True,
-    use_mobile_attention: bool = True,
+    use_sla: bool = True,
     exit_level: int = 4,
     use_sppf: bool = False,
     sppf_activation: str = "silu",
-) -> RT_Focuser_MobileGAM:
-    return RT_Focuser_MobileGAM(
+) -> RTFocuserV2:
+    return RTFocuserV2(
         dims=dims,
         depths=depths,
         kernels=kernels,
         act=act,
         upsample_mode=upsample_mode,
         use_sharpen=use_sharpen,
-        use_mobile_attention=use_mobile_attention,
+        use_sla=use_sla,
         exit_level=exit_level,
         use_sppf=use_sppf,
         sppf_activation=sppf_activation,
     )
 
 
-def load_model(checkpoint: Union[str, Path], device: Union[str, torch.device] = "cpu", strict: bool = True) -> RT_Focuser_MobileGAM:
+def load_model(checkpoint: Union[str, Path], device: Union[str, torch.device] = "cpu", strict: bool = True) -> RTFocuserV2:
     """Load the standard model from a state dict or training checkpoint."""
     state = torch.load(checkpoint, map_location=device, weights_only=True)
     if isinstance(state, dict) and "model" in state:
@@ -534,15 +534,15 @@ def load_model(checkpoint: Union[str, Path], device: Union[str, torch.device] = 
         key.removeprefix("module.").removeprefix("model."): value
         for key, value in state.items()
     }
-    model = RT_Focuser_MobileGAM_Standard().to(device)
+    model = build_rt_focuser_v2().to(device)
     model.load_state_dict(state, strict=strict)
     model.eval()
     return model
 
 
 # Public names used by the release examples.
-RTFocuserV2 = RT_Focuser_MobileGAM
-build_model = RT_Focuser_MobileGAM_Standard
+RT_Focuser_V2 = RTFocuserV2
+build_model = build_rt_focuser_v2
 
 
 @torch.no_grad()
@@ -630,7 +630,7 @@ def export_coreml(model: nn.Module, x: Tensor, path: Path, compute_unit: str = "
 def _main() -> None:
     parser = argparse.ArgumentParser(description="RT-Focuser-V2 export and benchmark")
     parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--out-dir", default="exports/rt-focuser-mobilegam")
+    parser.add_argument("--out-dir", default="exports/rt-focuser-v2")
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--warmup", type=int, default=10)
@@ -640,7 +640,7 @@ def _main() -> None:
     parser.add_argument("--exit", type=int, choices=[1, 2, 3, 4], default=4)
     parser.add_argument("--upsample-mode", default="nearest", choices=["nearest", "bilinear"])
     parser.add_argument("--no-sharpen", action="store_true")
-    parser.add_argument("--no-mobile-attention", action="store_true")
+    parser.add_argument("--no-sla", action="store_true")
     parser.add_argument("--use-sppf", action="store_true")
     parser.add_argument("--sppf-act", default="silu", choices=["relu", "relu6", "hardswish", "silu", "gelu"])
     parser.add_argument("--skip-onnx", action="store_true")
@@ -654,11 +654,11 @@ def _main() -> None:
     if args.checkpoint:
         model = load_model(args.checkpoint, device="cpu", strict=True)
     else:
-        model = RT_Focuser_MobileGAM_Standard(
+        model = build_rt_focuser_v2(
             act=args.act,
             upsample_mode=args.upsample_mode,
             use_sharpen=not args.no_sharpen,
-            use_mobile_attention=not args.no_mobile_attention,
+            use_sla=not args.no_sla,
             exit_level=args.exit,
             use_sppf=args.use_sppf,
             sppf_activation=args.sppf_act,
@@ -676,14 +676,14 @@ def _main() -> None:
         "exit_level": args.exit,
         "upsample_mode": args.upsample_mode,
         "use_sharpen": not args.no_sharpen,
-        "use_mobile_attention": not args.no_mobile_attention,
+        "use_sla": not args.no_sla,
         "use_sppf": args.use_sppf,
         "sppf_activation": args.sppf_act if args.use_sppf else None,
         "pytorch_cpu": benchmark_torch(model, x, warmup=args.warmup, runs=args.runs),
     }
 
-    onnx_path = out_dir / "rt-focuser-mobilegam.onnx"
-    mlpackage_path = out_dir / "rt-focuser-mobilegam.mlpackage"
+    onnx_path = out_dir / "rt-focuser-v2.onnx"
+    mlpackage_path = out_dir / "rt-focuser-v2.mlpackage"
     if not args.skip_onnx:
         if not args.benchmark_only or not onnx_path.exists():
             export_onnx(model, x, onnx_path, opset=args.opset)
