@@ -522,7 +522,7 @@ def RT_Focuser_MobileGAM_Standard(
 
 
 def load_model(checkpoint: Union[str, Path], device: Union[str, torch.device] = "cpu", strict: bool = True) -> RT_Focuser_MobileGAM:
-    """Load the standard ICTA 2026 model from a state dict or training checkpoint."""
+    """Load the standard model from a state dict or training checkpoint."""
     state = torch.load(checkpoint, map_location=device, weights_only=True)
     if isinstance(state, dict) and "model" in state:
         state = state["model"]
