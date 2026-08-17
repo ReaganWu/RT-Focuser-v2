@@ -1,0 +1,16 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+runs/
+results/
+exports/
+data/
+datasets/
+*.log
+
+# Keep checkpoints out of normal commits. Publish the reviewed checkpoint as a release asset.
+weights/*.pth
+weights/*.pt
+weights/*.ckpt
